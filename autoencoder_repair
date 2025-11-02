@@ -1,0 +1,94 @@
+# Colab 셀 3: (수정된) AI 오토인코더 훈련 및 이상 탐지
+
+# (이전 셀에서 X_train_scaled, X_val_scaled, preprocessor, X가 생성되었다고 가정)
+if 'X_train_scaled' not in locals() or 'preprocessor' not in locals():
+    print("!!! 에러: X_train_scaled 또는 preprocessor 변수를 찾을 수 없습니다.")
+    print("이전 셀(전처리)을 먼저 실행해 주세요.")
+
+else:
+    # 1. 모델 정의 (수정: Decoder 활성화 함수 변경)
+    # -----------------------------------------------------------------
+    # StandardScaler (평균 0, 표준편차 1)로 스케일링했으므로,
+    # 0~1로 출력을 제한하는 'sigmoid'를 사용하면 안 됩니다.
+    # 입력 범위를 그대로 복원할 수 있는 'linear' (또는 None)를 사용해야 합니다.
+    
+    input_dim = X_train_scaled.shape[1]
+    encoding_dim = int(input_dim / 2) # 잠재 공간 크기
+
+    input_layer = Input(shape=(input_dim,))
+    encoder = Dense(encoding_dim, activation="relu")(input_layer)
+    # (수정) 'sigmoid' -> 'linear' (또는 None)
+    decoder = Dense(input_dim, activation="linear")(input_layer) 
+
+    autoencoder = Model(inputs=input_layer, outputs=decoder)
+    autoencoder.compile(optimizer='adam', loss='mse') # Mean Squared Error (MSE) 손실 사용
+
+    print("Autoencoder 모델 정의 완료 (Decoder=linear).")
+
+    # 2. 학습 (수정: 올바른 데이터셋 사용)
+    # -----------------------------------------------------------------
+    # (수정) 'network_calls < 5' 같은 임의의 기준(X_normal)을 제거합니다.
+    # 비지도 학습은 X_train_scaled 전체를 '대부분 정상'이라 가정하고 학습합니다.
+    # (수정) validation_split 대신 X_val_scaled를 직접 사용합니다.
+    
+    print("Autoencoder(신뢰도 검증) 학습 시작...")
+    history = autoencoder.fit(
+        X_train_scaled, X_train_scaled, # 훈련 (스케일링된 훈련 데이터)
+        epochs=50,
+        batch_size=32,
+        shuffle=True,
+        validation_data=(X_val_scaled, X_val_scaled), # 검증 (스케일링된 검증 데이터)
+        verbose=0 # Colab에서 출력 간소화
+    )
+    print("Autoencoder 학습 완료.")
+
+    # 3. 신뢰도 점수 산출 (수정: 스케일링된 전체 데이터 사용)
+    # -----------------------------------------------------------------
+    # (수정) X_dynamic(스케일링 전)이 아닌, 스케일링된 전체 데이터로 예측해야 합니다.
+    # 이전 셀의 'X' (스케일링 전 전체 데이터)를 'preprocessor'로 변환합니다.
+    
+    # (수정) 스케일링 안 된 X_dynamic 대신, 전체 X를 preprocessor로 변환
+    X_all_scaled = preprocessor.transform(X)
+    X_pred_scaled = autoencoder.predict(X_all_scaled)
+
+    # (수정) 스케일링된 원본과 복원본의 MSE(오차)를 계산
+    mse = np.mean(np.power(X_all_scaled - X_pred_scaled, 2), axis=1)
+    df_sbom['ZT_Anomaly_Score'] = mse
+
+    # (수정) MSE가 0인 경우(완벽 복원) max(mse)가 0이 되어 
+    #       NaN이 되는 것을 방지 (np.finfo(float).eps 사용)
+    max_mse = np.max(mse)
+    if max_mse == 0:
+        max_mse = np.finfo(float).eps # 0대신 아주 작은 값 사용
+        
+    df_sbom['ZT_Trust_Score'] = 1 - (mse / max_mse)
+    # 0보다 작은 값이 나올 경우 0으로 클리핑
+    df_sbom['ZT_Trust_Score'] = df_sbom['ZT_Trust_Score'].clip(lower=0)
+
+
+    # 4. AI 기반 '비정상(Anomaly)' 임계값 자동 정의 (3-시그마)
+    # (이 로직은 통계 기반이므로 그대로 사용합니다)
+    # -----------------------------------------------------------------
+    mean_mse = np.mean(mse)
+    std_mse = np.std(mse)
+    
+    # AI가 학습한 '복원 오차'의 통계적 분포를 기반으로 '정상 경계선' 자동 정의
+    ANOMALY_THRESHOLD = mean_mse + 3 * std_mse
+
+    # 5. 최종 비정상(Anomaly) 분류
+    # -----------------------------------------------------------------
+    df_sbom['is_ZT_Anomaly'] = df_sbom['ZT_Anomaly_Score'] > ANOMALY_THRESHOLD
+
+    print(f"\nAI가 자동 설정한 비정상 임계값 (3-시그마): {ANOMALY_THRESHOLD:.6f}")
+    print("AI가 스스로 정의한 '정상' 기준을 벗어난 컴포넌트 목록:")
+    
+    anomalies = df_sbom[df_sbom['is_ZT_Anomaly']]
+    
+    if anomalies.empty:
+        print("(AI가 판단한 '비정상' 컴포넌트가 없습니다.)")
+    else:
+        print(anomalies[['component', 'ZT_Anomaly_Score']].sort_values(
+            by='ZT_Anomaly_Score', ascending=False
+        ).to_markdown(index=False, floatfmt=".4f"))
+
+    print("\nAutoencoder 기반 신뢰도 점수 산출 및 비정상 분류 완료.")
