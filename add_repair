@@ -1,5 +1,5 @@
-# Colab 셀 2: (수정된) 특징 추출 및 전처리
-# (이 셀을 실행하기 전에 df_sbom이 로드되었다고 가정합니다)
+# Colab 셀 1: 라이브러리 설치
+!pip install tensorflow cyclonedx-python-lib pandas scikit-learn numpy
 
 # 라이브러리 임포트 (이전 셀에서 했더라도 명시성을 위해 포함)
 import pandas as pd
@@ -7,6 +7,10 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import ColumnTransformer
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --------------------------------------------------------------------------
 # 1. 동적 특징 생성 함수 (그대로 사용)
