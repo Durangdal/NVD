@@ -16,10 +16,9 @@ else:
     encoding_dim = int(input_dim / 2) # 잠재 공간 크기
 
     input_layer = Input(shape=(input_dim,))
-    encoder = Dense(encoding_dim, activation="relu")(input_layer)
     # (수정) 'sigmoid' -> 'linear' (또는 None)
-    decoder = Dense(input_dim, activation="linear")(input_layer) 
-
+    encoder = Dense(encoding_dim, activation="relu")(input_layer)
+    decoder = Dense(input_dim, activation="linear")(encoder)
     autoencoder = Model(inputs=input_layer, outputs=decoder)
     autoencoder.compile(optimizer='adam', loss='mse') # Mean Squared Error (MSE) 손실 사용
 
