@@ -1,0 +1,71 @@
+# Colab 셀 2: (수정된) 특징 추출 및 전처리
+# (이 셀을 실행하기 전에 df_sbom이 로드되었다고 가정합니다)
+
+# 라이브러리 임포트 (이전 셀에서 했더라도 명시성을 위해 포함)
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+
+# --------------------------------------------------------------------------
+# 1. 동적 특징 생성 함수 (그대로 사용)
+# --------------------------------------------------------------------------
+def dynamic_feature_engineering(df):
+    """PID, Path 정보를 원-핫 인코딩 및 수치화하여 동적 특징을 생성"""
+    df_temp = df.copy()
+
+    # 1. PID 존재 여부
+    df_temp['has_pid'] = df_temp['pid'].apply(lambda x: 1 if pd.notna(x) else 0)
+
+    # 2. Path 정보 (신뢰 경로)
+    df_temp['is_trusted_path'] = df_temp['description'].apply(
+        lambda x: 1 if isinstance(x, str) and ('/usr/lib/' in x or '/usr/bin/' in x) else 0
+    )
+
+    # 3. (가상) API 호출 패턴
+    np.random.seed(42)
+    df_temp['network_calls'] = np.random.randint(0, 10, len(df_temp))
+    df_temp['memory_peak'] = np.random.rand(len(df_temp)) * 100
+
+    return df_temp
+
+# --------------------------------------------------------------------------
+# 2. (수정) 올바른 전처리 및 데이터 분리 로직
+# --------------------------------------------------------------------------
+if 'df_sbom' not in locals():
+    print("!!! 에러: df_sbom 변수를 찾을 수 없습니다.")
+    print("이전 셀에서 df_sbom이 로드되었는지 확인하세요.")
+else:
+    # 1. 특징 생성 함수 호출
+    df_sbom = dynamic_feature_engineering(df_sbom)
+
+    # 2. 특징을 성격에 따라 분리
+    CONTINUOUS_FEATURES = ['network_calls', 'memory_peak']
+    BINARY_FEATURES = ['has_pid', 'is_trusted_path']
+    ALL_FEATURES = CONTINUOUS_FEATURES + BINARY_FEATURES
+    
+    # 3. ColumnTransformer 정의 (연속형만 스케일링)
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('scaler', StandardScaler(), CONTINUOUS_FEATURES),
+            ('binary', 'passthrough', BINARY_FEATURES)
+        ],
+        remainder='drop'
+    )
+
+    # 4. 데이터 유출 방지: **전처리 전에** 데이터 분리
+    X = df_sbom[ALL_FEATURES]
+    X_train, X_val = train_test_split(X, test_size=0.2, random_state=42)
+
+    print(f"Total data: {len(X)}, Train data: {len(X_train)}, Validation data: {len(X_val)}")
+
+    # 5. 훈련(Train) 데이터로만 'fit' (학습)
+    X_train_scaled = preprocessor.fit_transform(X_train)
+    
+    # 6. 검증(Validation) 데이터는 'transform' (변환)만 적용
+    X_val_scaled = preprocessor.transform(X_val)
+
+    print("\n✅ 올바른 전처리 및 스케일링 완료 (Data Leakage 방지).")
+    print("Scaled training data shape:", X_train_scaled.shape)
+    print("Scaled validation data shape:", X_val_scaled.shape)
