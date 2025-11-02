@@ -1,0 +1,183 @@
+import pandas as pd
+import numpy as np
+# import requests # <- 더 이상 OSV API를 호출하지 않으므로 필요 없습니다.
+import subprocess # <- Trivy를 실행하기 위해 새로 추가
+import json       # <- Trivy의 JSON 출력을 파싱하기 위해 새로 추가
+import os         # <- 임시 SBOM 파일을 생성/삭제하기 위해 새로 추가
+
+# --------------------------------------------------------------------------
+# 1. 런타임 SBOM 데이터 로드 (동일)
+# --------------------------------------------------------------------------
+data = {
+    'component': ['requests', 'flask', 'urllib3', 'jinja2', 'zlib'],
+    'version': ['2.28.1', '2.2.3', '1.26.0', '3.1.2', '1.2.11'],
+    'purl': [
+        'pkg:pypi/requests@2.28.1',
+        'pkg:pypi/flask@2.2.3',
+        'pkg:pypi/urllib3@1.26.0',
+        'pkg:pypi/jinja2@3.1.2',
+        'pkg:generic/zlib@1.2.11?arch=any'
+    ],
+    'pid': [1234, 5678, 9012, None, 3456],
+    'description': [
+        '/usr/lib/python3.10/site-packages/requests/__init__.py',
+        '/usr/lib/python3.10/site-packages/flask/__init__.py',
+        '/usr/lib/python3.10/site-packages/urllib3/__init__.py',
+        'Jinja2 template engine',
+        '/usr/bin/zlib'
+    ]
+}
+df_sbom = pd.DataFrame(data)
+
+# --------------------------------------------------------------------------
+# 2. (신규) Trivy가 읽을 수 있는 CycloneDX SBOM 파일 생성 헬퍼
+# --------------------------------------------------------------------------
+def create_cyclonedx_sbom(df, filename="temp_sbom.json"):
+    """
+    Pandas DataFrame을 Trivy가 스캔할 수 있는
+    최소한의 CycloneDX 형식 SBOM JSON 파일로 변환합니다.
+    """
+    components = []
+    for _, row in df.iterrows():
+        if pd.notna(row['purl']):
+            # PURL만 제공해도 Trivy가 잘 인식합니다.
+            components.append({
+                "type": "library",
+                "name": row['component'],
+                "version": row['version'],
+                "purl": row['purl']
+            })
+
+    # CycloneDX SBOM 기본 구조
+    sbom_data = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.4",
+        "version": 1,
+        "components": components
+    }
+    
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(sbom_data, f)
+    
+    return filename
+
+# --------------------------------------------------------------------------
+# 3. Trivy 실행 및 취약점 분석 함수 (수정됨)
+# --------------------------------------------------------------------------
+def check_vulnerability_with_trivy(df_sbom):
+    """
+    Trivy CLI를 실행하여 SBOM 파일의 취약점을 분석합니다.
+    (OSV API 대신 Trivy 사용)
+    """
+    
+    sbom_filename = "temp_sbom.json"
+    
+    try:
+        # 1. DataFrame을 임시 SBOM 파일로 생성
+        create_cyclonedx_sbom(df_sbom, sbom_filename)
+
+        # 2. Trivy 명령어 준비
+        # 'trivy sbom [파일명]' - JSON 형식으로 결과를 요청
+        command = [
+            "trivy", "sbom",
+            "--format", "json",
+            "--severity", "CRITICAL,HIGH,MEDIUM,LOW", # 모든 심각도 조회
+            sbom_filename
+        ]
+
+        # 3. Trivy 명령어 실행
+        # 'subprocess.run'을 사용하여 'trivy'를 실행합니다.
+        result = subprocess.run(
+            command,
+            capture_output=True, # 표준 출력/에러를 캡처
+            text=True,           # 출력을 텍스트(utf-8)로 디코딩
+            check=True,          # Trivy 실행 실패 시 오류 발생
+            encoding='utf-8'
+        )
+        
+        # 4. Trivy JSON 결과 파싱
+        # Trivy는 취약점이 없으면 'null'이나 빈 'Results'를 반환할 수 있습니다.
+        if not result.stdout:
+            print("Trivy: No output received.")
+            return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='')
+
+        trivy_output = json.loads(result.stdout)
+        
+        # 'Results' 키가 없거나 비어있을 수 있음
+        if not trivy_output or not trivy_output.get('Results'):
+            print("Trivy: No vulnerabilities found.")
+            return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='')
+
+        # Trivy는 SBOM 파일 자체를 하나의 'Target'으로 봅니다.
+        vulnerabilities = trivy_output['Results'][0].get('Vulnerabilities', [])
+
+        if not vulnerabilities:
+            print("Trivy: No vulnerabilities found in components.")
+            return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='')
+
+        # 5. 결과를 DataFrame으로 가공
+        vuln_data = []
+        for vuln in vulnerabilities:
+            # Trivy는 여러 CVSS 점수(NVD, RedHat 등)를 제공합니다.
+            # 여기서는 NVD의 CVSS v3.1 점수를 우선 사용합니다.
+            cvss_score = np.nan
+            if 'CVSS' in vuln and 'nvd' in vuln['CVSS']:
+                cvss_score = vuln['CVSS']['nvd'].get('V3Score', np.nan)
+            
+            vuln_data.append({
+                'component': vuln['PkgName'],
+                'cve_id': vuln['VulnerabilityID'],
+                'cvss_score': cvss_score,
+                'is_vulnerable': True
+            })
+
+        if not vuln_data:
+             return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='')
+
+        # 6. 원본 df_sbom과 병합
+        df_results = pd.DataFrame(vuln_data)
+        
+        # 동일 컴포넌트에 여러 CVE가 있을 수 있으므로, 가장 심각한(max) 점수를 기준으로 요약
+        df_summary = df_results.groupby('component').agg(
+            cve_id=('cve_id', 'first'), # 데모용: 첫 번째 CVE ID
+            cvss_score=('cvss_score', 'max'), # 가장 높은 CVSS 점수
+            is_vulnerable=('is_vulnerable', 'any') # 하나라도 있으면 True
+        ).reset_index()
+
+        df_merged = df_sbom.merge(df_summary, on='component', how='left')
+        
+        # 취약점이 발견되지 않은 컴포넌트 처리
+        df_merged['is_vulnerable'] = df_merged['is_vulnerable'].fillna(False)
+        df_merged['cve_id'] = df_merged['cve_id'].fillna('')
+
+        return df_merged
+
+    except FileNotFoundError:
+        print("!!! 에러: 'trivy' 명령어를 찾을 수 없습니다.")
+        print("Trivy가 설치되어 있고 시스템 PATH에 등록되어 있는지 확인하세요.")
+        return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='TRIVY_NOT_FOUND')
+    
+    except subprocess.CalledProcessError as e:
+        # Trivy 실행 중 오류 발생 시 (예: 잘못된 파일)
+        print(f"Trivy 실행 실패: {e}")
+        print(f"Stderr: {e.stderr}")
+        return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='TRIVY_ERROR')
+        
+    except json.JSONDecodeError:
+        print(f"Trivy JSON 출력 파싱 실패. Raw output: {result.stdout}")
+        return df_sbom.assign(is_vulnerable=False, cvss_score=np.nan, cve_id='JSON_PARSE_ERROR')
+
+    finally:
+        # 7. 스캔이 끝나면 임시 SBOM 파일 삭제
+        if os.path.exists(sbom_filename):
+            os.remove(sbom_filename)
+
+# --------------------------------------------------------------------------
+# 4. 프로그램 실행 및 결과 출력 (수정됨)
+# --------------------------------------------------------------------------
+# 수정한 함수를 호출
+df_sbom = check_vulnerability_with_trivy(df_sbom)
+
+print("### 런타임 SBOM 기반 Trivy 스캔 결과 (NVD 점수 기반) ###")
+# 결과를 Markdown 테이블 형식으로 출력
+print(df_sbom[['component', 'version', 'is_vulnerable', 'cvss_score', 'cve_id']].to_markdown(index=False, floatfmt=".1f"))
